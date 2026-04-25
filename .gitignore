@@ -1,0 +1,14 @@
+# Models — never check in weights
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Local environment
+.env
+.venv/
+
+# Misc
+.DS_Store
+*.swp
+__pycache__/
