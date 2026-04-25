@@ -1,52 +1,53 @@
 # ===========================================================================
-# Dual RTX 3090 — Qwen3.6-27B Lorbus int4-AutoRound + MTP + fp8 KV + vision.
+# EXPLORATORY: TP=2 + TurboQuant KV (turboquant_3bit_nc) + MTP n=3 + Genesis v7.14.
 #
-# What this gives you (vs the single-card project's default):
-#   - TP=2 across both 3090s — meaningfully higher TPS, much more headroom
-#   - max_num_seqs=2 → 2 concurrent agents at full 262K context (KV pool 168K/2.36×)
-#   - max_model_len=262144 → model's natural max, no rope_scaling needed
-#   - vision + tools + MTP n=3 + recall — everything on, no compromises
+# Question: with v7.14 P65 (cudagraph downgrade for spec-decode) applied, does
+# MTP × TurboQuant work on dual-card TP=2 with vision + tools + 262K?
 #
-# What's intentionally NOT enabled:
-#   - TurboQuant KV — sidesteps vllm#40831 entirely. fp8_e5m2 has none of
-#     that bug's caveats and is plenty for 64K context across both cards.
+# If yes: this is a strict superset of the fp8 default (more KV pool → either
+# more concurrent streams at 262K or more ctx at same concurrency).
 #
-# Dependencies:
-#   - 2× RTX 3090 (Ampere SM 8.6), PCIe-only (no NVLink — works fine)
-#   - vLLM PR #40361 (Marlin pad-sub-tile-n) — patched files volume-mounted
-#     from /opt/ai/vllm-src/. PR is open upstream; drop the mount when it
-#     lands. See patches/README.md for context.
+# Genesis v7.14 also includes:
+#   - P4 hybrid turboquant support (replaces standalone PR #39931 patches)
+#   - P5 KV page-size unification for hybrid models
+#   - P64 streaming MTP tool-call edge case
+#   - P66 cudagraph_capture_sizes divisibility filter
+# Plus our patch_tolist_cudagraph.py for the .tolist() crash class.
 #
-# Run:
-#   cd compose && docker compose up -d
+# To run: cd compose && docker compose -f docker-compose.turbo.yml up -d
 # ===========================================================================
 services:
-  vllm-qwen36-27b-dual:
-    # Tracking latest nightly intentionally — this stack uses fp8 KV (not
-    # TurboQuant), so it doesn't accumulate the same anchor-drift exposure
-    # the single-card project does. Pin if you hit a regression; otherwise
-    # ride the wave.
+  vllm-qwen36-27b-dual-turbo:
     image: vllm/vllm-openai:nightly
-    container_name: vllm-qwen36-27b-dual
+    container_name: vllm-qwen36-27b-dual-turbo
     restart: "no"
     ports:
-      - "8010:8000"
+      - "8011:8000"
     volumes:
       - ${MODEL_DIR:-/mnt/models/huggingface}:/root/.cache/huggingface
-      # Marlin pad-sub-tile-n patch (vLLM PR #40361) — required for TP=2
-      # on AutoRound W4A16 models where out-dim shards fall below 64.
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:ro
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:ro
+      # Genesis v7.14 modular package (includes P4 hybrid TQ + P65 #40880 fix)
+      - /opt/ai/vendor/genesis-vllm-patches/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Standalone .tolist() during capture fix (separate bug from P65)
+      - /opt/ai/vendor/genesis-vllm-patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      # PCIe-only stack — disable NCCL features that assume NVLink.
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1
       - VLLM_USE_FLASHINFER_SAMPLER=1
       - OMP_NUM_THREADS=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      # Genesis v7.14 opt-in patches for #40880 fix:
+      - GENESIS_ENABLE_P65_TURBOQUANT_SPEC_CG_DOWNGRADE=1
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -56,6 +57,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    entrypoint: ["/bin/bash", "-c", "pip install xxhash pandas scipy -q && python3 -m vllm._genesis.patches.apply_all && python3 /patches/patch_tolist_cudagraph.py && exec vllm serve \"$@\"", "--"]
     command:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
@@ -71,13 +73,13 @@ services:
       - --max-model-len
       - "262144"
       - --gpu-memory-utilization
-      - "0.92"
+      - "0.85"
       - --max-num-seqs
-      - "2"
+      - "4"
       - --max-num-batched-tokens
-      - "8192"
+      - "4128"
       - --kv-cache-dtype
-      - fp8_e5m2
+      - turboquant_k8v4
       - --trust-remote-code
       - --reasoning-parser
       - qwen3

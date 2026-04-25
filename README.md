@@ -13,18 +13,23 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ## Status at a glance
 
-One configuration today, fully functional.
+Four configurations, all functional and end-to-end verified (10K / 30K / 60K / 90K recall ladder passes for each).
 
-| Variant | Context | Single-stream TPS (narr / code) | Concurrent throughput | Vision | Caveats |
+| Variant | Context | Single-stream TPS (narr / code) | Concurrency at 262K | Vision | Niche |
 |---|---|---|---|---|---|
-| **Default** (`docker-compose.yml`) | **262K** | 68 / 89 short-prompt · 36 at 100K loaded · 28 at 200K loaded | **257 TPS at 4 concurrent**, **385 TPS at 8 concurrent** (short prompts) | ✅ | Depends on vllm#40361 patch (volume-mounted) |
+| **Default** (`docker-compose.yml`) — fp8 + MTP | **262K** | **71 / 89** | 2.36× | ✅ | Best per-stream TPS · general use |
+| **Turbo** (`docker-compose.turbo.yml`) — TurboQuant_3bit_nc + MTP + Genesis v7.14 | **262K** | 58 / 69 | **4.59×** | ✅ | **9× the KV pool · 4-stream serving** |
+| **DFlash** (`docker-compose.dflash.yml`) — DFlash N=5 + vision | 185K | **78 / 128** | 1× | ✅ | Fastest single-stream code with vision |
+| **DFlash text-only** (`docker-compose.dflash-noviz.yml`) — DFlash N=5 + 200K | 200K | 77 / 124 | 1× | ❌ | Fastest single-stream max-ctx |
+
+All variants depend on **vllm#40361** (Marlin pad-sub-tile-n) volume-mounted from local source. Turbo additionally depends on **Genesis v7.14 patches** for the [#40880](https://github.com/vllm-project/vllm/issues/40880) MTP × TurboQuant × cudagraph fix (P64/P65/P66/P68/P69 enabled via env opts).
 
 ### What this gives you over the single-card project
 
-- **Real concurrent serving** — 8 simultaneous requests at ~50 TPS each = **385 TPS aggregate system throughput**, vs single-card's ~85 TPS hard cap (max_num_seqs=1). About 4.5× the multi-user capacity.
-- **64K context** instead of 20K with vision (or 75K text-only) — fp8 KV at TP=2 has 3× the headroom.
-- **No TurboQuant complications** — sidesteps [vllm#40831](https://github.com/vllm-project/vllm/issues/40831) entirely. Full cudagraph + torch.compile speed.
-- **More headroom for future variants** — DFlash draft, larger context, etc. would all fit comfortably.
+- **Full 262K context** — fp8 default fits the model's natural max with 2.36× concurrency. No `max-model-len` compromise.
+- **Real concurrent serving** — fp8 default supports 2 concurrent at full ctx; turbo variant unlocks 4 concurrent at full 262K (9× the KV pool).
+- **DFlash spec-decode at 78/128 TPS** — both vision and no-vision variants validated. Single-stream peak performance.
+- **All multimodal features** — vision, tools, thinking, recall, streaming, MTP n=3 / DFlash N=5 spec-decode (your pick), prefix caching, chunked prefill.
 
 ### What this does NOT give you
 
@@ -36,11 +41,11 @@ One configuration today, fully functional.
 - **vLLM PR #40361 patched source** at `/opt/ai/vllm-src/` (or wherever — set `VLLM_SRC_DIR`). Without this, vLLM crashes during model load on TP=2 with a `GPTQ_MARLIN_MIN_THREAD_N (64) > out_features` error. See `patches/README.md`.
 - ~30 GB free disk (model + Marlin source checkout)
 
-### What's NOT enabled (intentionally)
+### TurboQuant + Genesis v7.14 — now an option
 
-- **TurboQuant KV** — skipped to dodge [vllm#40831](https://github.com/vllm-project/vllm/issues/40831). fp8_e5m2 has plenty of headroom at TP=2 for 64K, no functional caveats.
-- **Genesis patches** — only relevant when using TurboQuant on hybrid models. Not loaded.
-- **`patch_tolist_cudagraph.py`** (from the single-card project) — fixes a TurboQuant-specific crash. Not loaded.
+The Turbo variant (`docker-compose.turbo.yml`) loads TurboQuant_3bit_nc KV with Genesis v7.14 patches enabled. v7.14 (released 2026-04-25) closes [#40880](https://github.com/vllm-project/vllm/issues/40880) (MTP × TurboQuant × cudagraph corruption) via P65's cudagraph downgrade for spec-decode. The fp8 default doesn't load Genesis at all — it doesn't need to.
+
+**Per-stream cost of the Turbo variant:** ~25% TPS regression vs fp8 (P65 forces `cudagraph_mode=PIECEWISE` for spec-decode → eager continuation). **Concurrency win:** 4.59× streams at full 262K vs fp8's 2.36×, so aggregate throughput exceeds fp8 above ~3 concurrent streams.
 
 ---
 
@@ -116,23 +121,49 @@ The cost is needing two cards and the Marlin pad patch. Once vllm#40361 lands, t
 
 ---
 
-## Why we skip TurboQuant on this stack
+## When to pick TurboQuant (Turbo variant)
 
-The [single-card project's long-context variant](https://github.com/noonghunna/qwen36-27b-single-3090/blob/main/compose/docker-compose.longctx-experimental.yml) uses TurboQuant 3-bit KV to fit 125K context on a single 3090 with vision. That hits [vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (CUDA graph capture × spec-decode produces degenerate token loops) and ships a `cudagraph_mode=NONE` workaround at -60% TPS.
+The Turbo variant unlocks 4-stream concurrency at full 262K (KV pool: 1.5M tokens vs fp8's 168K — 9× more). It applies Genesis v7.14 patches to fix the [#40880](https://github.com/vllm-project/vllm/issues/40880) bug class that previously made TurboQuant + MTP + cudagraph silently corrupt tool-call output.
 
-On dual-card we don't need TurboQuant — fp8_e5m2 KV at TP=2 has enough headroom for 64K context, and the bug doesn't fire on fp8. Full cudagraph + torch.compile speed, no workaround. The 65K vs 125K context tradeoff is worth it for the speed and simplicity.
+**Pick Turbo if:**
+- You're serving 4+ concurrent agents at long ctx (RAG batch jobs, multi-user team workloads)
+- KV pool dominance matters (long-running sessions with prefix-cached state)
 
-If you specifically need >64K context on dual-card, TurboQuant would re-introduce the same `cudagraph_mode=NONE` workaround pattern from the single-card long-context variant. Not yet attempted on this repo.
+**Stay on fp8 default if:**
+- Single-stream latency / TPS matters more than concurrency
+- You don't routinely hit 4+ concurrent
+- Per-stream code TPS (89 vs 69) is your main metric
+
+**Cost of Turbo:** P65's cudagraph downgrade (FULL → PIECEWISE for spec-decode) costs ~25% per-stream TPS. Crossover with fp8 happens around 3 concurrent streams; above that Turbo wins on aggregate.
+
+We had to also adjust two consumer-Ampere knobs vs Sandermage's A5000-class defaults: `gpu-memory-utilization 0.92 → 0.85` and `max-num-batched-tokens 8192 → 4128`. These leave activation headroom that Sandermage's 32 GB cards already had. Without them, deep-prefill (60K+) requests OOM. See `compose/docker-compose.turbo.yml` for the working config.
 
 ---
 
 ## Pick a compose variant
 
-Currently one variant. More may follow as we benchmark different configs.
+Only one container can bind a given port at a time — `docker compose down` (with the right `-f`) before switching.
 
 ```bash
+# Default: fp8 + MTP n=3 + 262K + vision + 2 streams (port 8010)
 cd compose && docker compose up -d
+
+# Turbo: TurboQuant_3bit_nc + MTP n=3 + Genesis v7.14 + 4-stream concurrency (port 8011)
+cd compose && docker compose -f docker-compose.turbo.yml up -d
+
+# DFlash with vision: N=5 + 185K + vision + 1 stream (port 8012, fastest single-user)
+cd compose && docker compose -f docker-compose.dflash.yml up -d
+
+# DFlash text-only: N=5 + 200K, no vision + 1 stream (port 8013, fastest max-ctx)
+cd compose && docker compose -f docker-compose.dflash-noviz.yml up -d
 ```
+
+### Decision tree
+
+- **Multi-tenant or many concurrent agents at long ctx?** → **Turbo** (4-stream at 262K, 9× KV pool)
+- **General use, vision matters, balanced TPS + ctx?** → **Default fp8** (best per-stream, 2 streams, 262K)
+- **Solo user, code-heavy, want max single-stream TPS?** → **DFlash with vision** (78/128 TPS, 185K)
+- **Need >185K ctx and don't need vision?** → **DFlash text-only** (200K, no vision)
 
 ---
 
@@ -210,18 +241,21 @@ Cold prefill is the dominant cost at long context — vLLM chunked-prefills at 8
 
 ```
 qwen36-dual-3090/
-├── README.md                        (this file)
-├── LICENSE                          Apache-2.0
+├── README.md                              (this file)
+├── LICENSE                                Apache-2.0
 ├── .gitignore
 ├── patches/
-│   └── README.md                    Marlin pad PR #40361 dependency notes
+│   └── README.md                          Marlin pad PR #40361 dependency notes
 ├── compose/
-│   └── docker-compose.yml           DEFAULT — Lorbus + TP=2 + MTP + fp8 + vision, 64K
+│   ├── docker-compose.yml                 DEFAULT — fp8 + MTP n=3 + 262K + vision (port 8010)
+│   ├── docker-compose.turbo.yml           Turbo — TurboQuant_3bit_nc + Genesis v7.14 + 4-stream (port 8011)
+│   ├── docker-compose.dflash.yml          DFlash — N=5 + 185K + vision (port 8012)
+│   └── docker-compose.dflash-noviz.yml    DFlash text-only — N=5 + 200K (port 8013)
 └── scripts/
-    ├── setup.sh                     download + SHA verify model + check Marlin patch
-    ├── verify.sh                    quick smoke test (~10 sec)
-    ├── verify-full.sh               full functional test (~3 min)
-    └── bench.sh                     canonical TPS bench
+    ├── setup.sh                           download + SHA verify model + check Marlin patch
+    ├── verify.sh                          quick smoke test (~10 sec)
+    ├── verify-full.sh                     full functional test incl. needle ladder (~3 min)
+    └── bench.sh                           canonical TPS bench
 ```
 
 ---
@@ -229,7 +263,9 @@ qwen36-dual-3090/
 ## Upstream status
 
 - **[vllm-project/vllm#40361](https://github.com/vllm-project/vllm/pull/40361)** — Marlin pad-sub-tile-n. **OPEN, MERGEABLE**, labeled `bug`, awaiting maintainer review. When this lands, drop the `/opt/ai/vllm-src/` mounts from the compose and just use upstream nightly.
-- **[vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831)** — TurboQuant × spec-decode cudagraph bug. We dodge it entirely by using fp8 KV. Not relevant to this stack.
+- **[vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831)** — TurboQuant × spec-decode cudagraph bug (closed for ngram path via Sander's v7.13). Default fp8 variant dodges it; Turbo variant relies on Genesis v7.14 P65 to work around it for the MTP path.
+- **[vllm-project/vllm#40880](https://github.com/vllm-project/vllm/issues/40880)** — MTP × TurboQuant × cudagraph corruption. Root-caused by Sandermage 2026-04-25; v7.14 patches (P64/P65/P66/P68/P69) fix it as a workaround. Proper fix awaits a custom Triton multi-query kernel (P67 design only). The Turbo variant of this repo applies v7.14 + the necessary consumer-Ampere knobs.
+- **[vllm-project/vllm#40334](https://github.com/vllm-project/vllm/pull/40334)** — DFlash `combine_hidden_states` dtype mismatch fix. **OPEN, NOT MERGED**. Workaround in our DFlash variants: `--dtype bfloat16` (matches the draft's training dtype, sidesteps the fp32→fp16 cast).
 
 ---
 
@@ -237,10 +273,12 @@ qwen36-dual-3090/
 
 - **Qwen team** (@Alibaba_Qwen) — base model + MTP head architecture
 - **Lorbus** — AutoRound INT4 quant with preserved BF16 `mtp.fc`
+- **[Sandermage](https://github.com/Sandermage)** — Genesis v7.14 patch tree (P65 cudagraph downgrade, P66 capture-size filter, P64 streaming MTP, P68/P69 long-ctx tool adherence) that unblocks TurboQuant + MTP for the Turbo variant. Root-caused [#40880](https://github.com/vllm-project/vllm/issues/40880) and shipped a fix in 36 hours.
+- **z-lab** — DFlash draft model for Qwen3.6-27B
 - **vLLM project** — TurboQuant infrastructure and the Marlin kernel we patched
 - **Intel AutoRound** — quantization framework
 
-Our contribution: the Marlin pad patch (PR #40361), this reproducible recipe, and the [companion single-card project](https://github.com/noonghunna/qwen36-27b-single-3090).
+Our contribution: the Marlin pad patch (PR #40361), this reproducible recipe with four variants for different workloads, and the [companion single-card project](https://github.com/noonghunna/qwen36-27b-single-3090).
 
 ---
 

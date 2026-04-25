@@ -1,46 +1,30 @@
 # ===========================================================================
-# Dual RTX 3090 — Qwen3.6-27B Lorbus int4-AutoRound + MTP + fp8 KV + vision.
+# DFlash spec-decode on TP=2 — TEXT-ONLY VARIANT (no vision tower).
 #
-# What this gives you (vs the single-card project's default):
-#   - TP=2 across both 3090s — meaningfully higher TPS, much more headroom
-#   - max_num_seqs=2 → 2 concurrent agents at full 262K context (KV pool 168K/2.36×)
-#   - max_model_len=262144 → model's natural max, no rope_scaling needed
-#   - vision + tools + MTP n=3 + recall — everything on, no compromises
+# vs docker-compose.dflash.yml (the with-vision variant): drops MoonViT to
+# free ~0.78 GiB per card → bumps max_model_len 185K → 200K (close to the
+# absolute DFlash ceiling on dual-3090 with FP16 KV).
 #
-# What's intentionally NOT enabled:
-#   - TurboQuant KV — sidesteps vllm#40831 entirely. fp8_e5m2 has none of
-#     that bug's caveats and is plenty for 64K context across both cards.
+# Numbers (D5 row in BENCHMARKS.md):
+#   77 narr / 124 code TPS, 200K ctx, 1 stream, AL 4.27 warm
 #
-# Dependencies:
-#   - 2× RTX 3090 (Ampere SM 8.6), PCIe-only (no NVLink — works fine)
-#   - vLLM PR #40361 (Marlin pad-sub-tile-n) — patched files volume-mounted
-#     from /opt/ai/vllm-src/. PR is open upstream; drop the mount when it
-#     lands. See patches/README.md for context.
-#
-# Run:
-#   cd compose && docker compose up -d
+# To run:
+#   cd compose && docker compose -f docker-compose.dflash-noviz.yml up -d
 # ===========================================================================
 services:
-  vllm-qwen36-27b-dual:
-    # Tracking latest nightly intentionally — this stack uses fp8 KV (not
-    # TurboQuant), so it doesn't accumulate the same anchor-drift exposure
-    # the single-card project does. Pin if you hit a regression; otherwise
-    # ride the wave.
+  vllm-qwen36-27b-dual-dflash:
     image: vllm/vllm-openai:nightly
-    container_name: vllm-qwen36-27b-dual
+    container_name: vllm-qwen36-27b-dual-dflash-noviz
     restart: "no"
     ports:
-      - "8010:8000"
+      - "8013:8000"
     volumes:
       - ${MODEL_DIR:-/mnt/models/huggingface}:/root/.cache/huggingface
-      # Marlin pad-sub-tile-n patch (vLLM PR #40361) — required for TP=2
-      # on AutoRound W4A16 models where out-dim shards fall below 64.
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:ro
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:ro
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      # PCIe-only stack — disable NCCL features that assume NVLink.
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1
@@ -64,20 +48,23 @@ services:
       - --quantization
       - auto_round
       - --dtype
-      - float16
+      - bfloat16
       - --tensor-parallel-size
       - "2"
       - --disable-custom-all-reduce
       - --max-model-len
-      - "262144"
+      - "200000"
       - --gpu-memory-utilization
-      - "0.92"
+      - "0.95"
       - --max-num-seqs
-      - "2"
+      - "1"
       - --max-num-batched-tokens
       - "8192"
-      - --kv-cache-dtype
-      - fp8_e5m2
+      # No --kv-cache-dtype: DFlash needs head_size=256 + non-causal attention,
+      # and no Ampere backend supports that triple with fp8/turbo KV. FP16 default
+      # is the only working choice (matches Qwen3.5-27B + DFlash row 4 = 89.7 TPS).
+      # --language-model-only frees ~0.78 GiB of MoonViT weights → 15K more KV ctx.
+      - --language-model-only
       - --trust-remote-code
       - --reasoning-parser
       - qwen3
@@ -87,7 +74,7 @@ services:
       - --enable-prefix-caching
       - --enable-chunked-prefill
       - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":3}'
+      - '{"method":"dflash","model":"/root/.cache/huggingface/qwen3.6-27b-dflash","num_speculative_tokens":5}'
       - --host
       - 0.0.0.0
       - --port
