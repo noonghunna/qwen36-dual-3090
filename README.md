@@ -119,6 +119,14 @@ What dual-card does NOT buy you on this model:
 
 The cost is needing two cards and the Marlin pad patch. Once vllm#40361 lands, the patch dependency drops and this is just `docker compose up`.
 
+> ### A note on NVLink
+>
+> **All numbers in this repo are measured PCIe-only — no NVLink bridge.** The RTX 3090 supports a third-party NVLink bridge (~112 GB/s), but we don't run one.
+>
+> Each TP=2 decode step requires an all-reduce after the QKV+output projection. On PCIe-4 (32 GB/s) at batch=1 this all-reduce takes a non-trivial fraction of the per-layer time, which is why dual-card single-stream TPS on this stack lands flat against single-card. With an NVLink bridge the all-reduce should drop substantially, and we'd expect single-stream TPS to scale closer to the memory-bandwidth doubling — plausibly ~100-130 TPS narrative range, though we haven't measured. Multi-stream throughput (4-8 concurrent) is bound by compute and VRAM rather than interconnect, so NVLink wouldn't change those much.
+>
+> If you have an NVLink bridge for your 3090s and run this recipe on it, we'd love to hear the numbers — the gap between PCIe-only and NVLink on this exact config isn't well documented anywhere we've seen.
+
 ---
 
 ## When to pick TurboQuant (Turbo variant)
