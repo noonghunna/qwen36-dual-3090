@@ -74,7 +74,11 @@ cd qwen36-dual-3090
 sudo mkdir -p /opt/ai && sudo chown $USER /opt/ai
 git clone -b marlin-pad-sub-tile-n https://github.com/noonghunna/vllm.git /opt/ai/vllm-src
 
-# 3. Download + SHA-verify the model (~20 GB, 10-30 min)
+# 3. Download + SHA-verify the model (~20 GB, 10-30 min) + clone Genesis patches (~50 MB)
+#    setup.sh now handles both: model download with SHA verification AND
+#    cloning Sandermage/genesis-vllm-patches into ./patches/genesis (used by
+#    the .turbo and .p67-bench composes). Set SKIP_GENESIS=1 to skip if you only
+#    need the default fp8 / DFlash composes.
 bash scripts/setup.sh
 
 # 4. Start the server
@@ -210,6 +214,17 @@ sudo nvidia-smi -pl 330 -i 1
 bash scripts/bench.sh
 ```
 
+The bench script reports three metrics per run + summary stats across all measured runs:
+
+- **`wall_TPS`** = `completion_tokens / wall_time` — user-perceived total speed (includes prefill cost)
+- **`decode_TPS`** = `completion_tokens / (wall_time − TTFT)` — pure model decode rate (excludes prefill)
+- **`TTFT`** — time to first token, captured via streaming
+- **Summary**: mean / std / **CV** / min / max for each TPS metric across N measured runs (default 5, 3 warmups; override via `RUNS=N WARMUPS=M bash scripts/bench.sh`)
+
+CV (coefficient of variation) is the headline stability metric — Sandermage's [vllm#40914](https://github.com/vllm-project/vllm/pull/40914) cross-rig validation case hinges on it. Spec-decode configs that drop CV below 5% are noticeably more predictable for SLA-sensitive use.
+
+You can also run `bash scripts/verify-full.sh --bench` to do "verify + measure" in one command — runs all correctness checks first (server up, tool calls, recall ladder, etc.) and then the bench if everything passes.
+
 Same canonical prompts as the single-card project (800-word essay, quicksort code), so numbers are directly comparable.
 
 ### Measured numbers (1× RTX 3090 each at 230W cap, vLLM nightly digest 9bba4628)
@@ -253,17 +268,21 @@ qwen36-dual-3090/
 ├── LICENSE                                Apache-2.0
 ├── .gitignore
 ├── patches/
-│   └── README.md                          Marlin pad PR #40361 dependency notes
+│   ├── README.md                          Marlin pad PR #40361 dependency notes
+│   └── genesis/                           cloned by setup.sh → Sandermage/genesis-vllm-patches
 ├── compose/
 │   ├── docker-compose.yml                 DEFAULT — fp8 + MTP n=3 + 262K + vision (port 8010)
 │   ├── docker-compose.turbo.yml           Turbo — TurboQuant_3bit_nc + Genesis v7.14 + 4-stream (port 8011)
 │   ├── docker-compose.dflash.yml          DFlash — N=5 + 185K + vision (port 8012)
-│   └── docker-compose.dflash-noviz.yml    DFlash text-only — N=5 + 200K (port 8013)
+│   ├── docker-compose.dflash-noviz.yml    DFlash text-only — N=5 + 200K (port 8013)
+│   ├── docker-compose.p67-bench.yml       BENCH — 27B + MTP + Genesis v7.48 P67/P78 (port 8013)
+│   ├── docker-compose.p67-bench-dflash.yml      BENCH — 27B + DFlash N=5 + Genesis v7.48 (port 8014)
+│   └── docker-compose.p67-bench-35b-dflash.yml  BENCH — 35B-A3B + DFlash + Genesis v7.48 (port 8015)
 └── scripts/
-    ├── setup.sh                           download + SHA verify model + check Marlin patch
+    ├── setup.sh                           model SHA-verify + clones genesis-vllm-patches
     ├── verify.sh                          quick smoke test (~10 sec)
-    ├── verify-full.sh                     full functional test incl. needle ladder (~3 min)
-    └── bench.sh                           canonical TPS bench
+    ├── verify-full.sh                     full functional test (~3 min); --bench flag chains bench.sh
+    └── bench.sh                           canonical TPS bench (wall_TPS / decode_TPS / TTFT / CV)
 ```
 
 ---
