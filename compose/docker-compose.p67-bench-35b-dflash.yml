@@ -1,0 +1,80 @@
+# ===========================================================================
+# BENCH-ONLY: 35B-A3B + DFlash N=5 with Genesis v7.48 patches.
+#
+# Apples-to-apples with Sandermage's setup: same model class
+# (Qwen3.6-35B-A3B), same patch tree, only quant differs (his FP8, our INT4).
+# Provides current-tree DFlash data for his MODELS.md.
+# ===========================================================================
+services:
+  vllm-qwen36-35b-p67-bench-dflash:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-qwen36-35b-p67-bench-dflash
+    restart: "no"
+    ports:
+      - "8015:8000"
+    volumes:
+      - ${MODEL_DIR:-/mnt/models/huggingface}:/root/.cache/huggingface
+      - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:ro
+      - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:ro
+      - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+      - GENESIS_ENABLE_P67_TQ_MULTI_QUERY_KERNEL=1
+      - GENESIS_ENABLE_P78_TOLIST_CAPTURE_GUARD=1
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/bin/bash", "-c", "pip install xxhash pandas scipy -q && python3 -m vllm._genesis.patches.apply_all && exec vllm serve \"$@\"", "--"]
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-35b-a3b-autoround-int4
+      - --served-model-name
+      - qwen3.6-35b-a3b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - bfloat16
+      - --tensor-parallel-size
+      - "2"
+      - --disable-custom-all-reduce
+      - --max-model-len
+      - "32768"
+      - --gpu-memory-utilization
+      - "0.90"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "4128"
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --speculative-config
+      - '{"model":"/root/.cache/huggingface/qwen3.6-35b-a3b-dflash","method":"dflash","num_speculative_tokens":5}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
