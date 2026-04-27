@@ -12,3 +12,4 @@ models/
 .DS_Store
 *.swp
 __pycache__/
+patches/genesis/

@@ -5,14 +5,17 @@
 #     SHA256 verification against HF x-linked-etag
 #   - verifies the Marlin pad-sub-tile-n patch (vLLM PR #40361) is in place
 #     at /opt/ai/vllm-src/ — required for TP=2 to work on AutoRound INT4
+#   - clones Sandermage/genesis-vllm-patches into ./patches/genesis (used by
+#     the .turbo and .p67-bench composes for TurboQuant + spec-decode paths)
 #
-# Note: unlike the single-card project, this stack does NOT need
-# Genesis patches (those are TurboQuant-on-hybrid specific; we use fp8 KV).
+# Note: the default and .dflash composes don't need Genesis patches (fp8 KV
+# path is independent). Genesis is only required for the TurboQuant variants.
 #
 # Env vars (optional):
 #   MODEL_DIR      Where to place the model. Default: ./models
 #   HF_TOKEN       HF token (public model, so usually unnecessary)
 #   SKIP_MODEL     Set to 1 to skip the model download step
+#   SKIP_GENESIS   Set to 1 to skip cloning Genesis patches
 #   VLLM_SRC_DIR   Where the patched vLLM source lives.
 #                  Default: /opt/ai/vllm-src
 #
@@ -25,6 +28,7 @@ MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models}"
 MODEL_REPO="Lorbus/Qwen3.6-27B-int4-AutoRound"
 MODEL_SUBDIR="qwen3.6-27b-autoround-int4"
 VLLM_SRC_DIR="${VLLM_SRC_DIR:-/opt/ai/vllm-src}"
+GENESIS_DIR="${ROOT_DIR}/patches/genesis"
 
 cd "${ROOT_DIR}"
 
@@ -35,12 +39,14 @@ need() {
     exit 1
   }
 }
+need git
 need curl
 need sha256sum
 
 echo "Setup root:    ${ROOT_DIR}"
 echo "Model dir:     ${MODEL_DIR}"
 echo "vLLM src dir:  ${VLLM_SRC_DIR}"
+echo "Genesis dir:   ${GENESIS_DIR}"
 
 # ---------- Marlin patch check ----------
 MARLIN_FILE="${VLLM_SRC_DIR}/vllm/model_executor/kernels/linear/mixed_precision/marlin.py"
@@ -61,6 +67,25 @@ if [[ ! -f "${MARLIN_FILE}" || ! -f "${MPLINEAR_FILE}" ]]; then
   exit 1
 else
   echo "[marlin]  Patched files in place at ${VLLM_SRC_DIR}"
+fi
+
+# ---------- Genesis patches (TurboQuant variants only) ----------
+# Tracks Sandermage/genesis-vllm-patches at HEAD. Required for the .turbo
+# and .p67-bench composes; ignored by the default and .dflash composes.
+if [[ "${SKIP_GENESIS:-0}" != "1" ]]; then
+  if [[ -d "${GENESIS_DIR}/.git" ]]; then
+    echo "[genesis]  Already cloned at ${GENESIS_DIR} — pulling latest ..."
+    (cd "${GENESIS_DIR}" && git pull --ff-only origin main 2>&1 | tail -3)
+  else
+    echo "[genesis]  Cloning Sandermage/genesis-vllm-patches ..."
+    git clone https://github.com/Sandermage/genesis-vllm-patches.git "${GENESIS_DIR}"
+  fi
+  if [[ ! -d "${GENESIS_DIR}/vllm/_genesis" ]]; then
+    echo "ERROR: genesis tree missing vllm/_genesis package — repo layout changed?" >&2
+    exit 1
+  fi
+else
+  echo "[genesis]  SKIP_GENESIS=1 — not cloning."
 fi
 
 # ---------- Model download ----------

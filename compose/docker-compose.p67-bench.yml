@@ -1,36 +1,35 @@
 # ===========================================================================
-# EXPLORATORY: TP=2 + TurboQuant KV (turboquant_3bit_nc) + MTP n=3 + Genesis v7.14.
+# BENCH-ONLY: Validate Genesis P67 / vllm#40914 on 2× 3090 (Ampere SM 8.6).
 #
-# Question: with v7.14 P65 (cudagraph downgrade for spec-decode) applied, does
-# MTP × TurboQuant work on dual-card TP=2 with vision + tools + 262K?
+# Question: does Sandermage's P67 multi-query Triton kernel give us the
+# +128% TPS he measured on 2× A5000, on our 2× 3090 hardware?
 #
-# If yes: this is a strict superset of the fp8 default (more KV pool → either
-# more concurrent streams at 262K or more ctx at same concurrency).
+# Differences vs docker-compose.turbo.yml:
+#   - max-model-len=32768 (small for fast bench iteration; not 262K)
+#   - P65 OFF (P67 supersedes it — restores FULL_AND_PIECEWISE cudagraph)
+#   - P67 ON (the multi-query kernel for K+1 spec-verify)
+#   - P78 ON (the .tolist() capture-guard, adapted from our patch)
+#   - Genesis tree pinned at v7.48+ (must have P67 — pull master)
 #
-# Genesis v7.14 also includes:
-#   - P4 hybrid turboquant support (replaces standalone PR #39931 patches)
-#   - P5 KV page-size unification for hybrid models
-#   - P64 streaming MTP tool-call edge case
-#   - P66 cudagraph_capture_sizes divisibility filter
-# Plus our patch_tolist_cudagraph.py for the .tolist() crash class.
-#
-# To run: cd compose && docker compose -f docker-compose.turbo.yml up -d
+# Run:
+#   cd compose && docker compose -f docker-compose.p67-bench.yml up -d
+#   # Wait for "Application startup complete"
+#   # Bench with the canonical 800-word essay prompt
+#   docker logs -f vllm-qwen36-27b-p67-bench
 # ===========================================================================
 services:
-  vllm-qwen36-27b-dual-turbo:
+  vllm-qwen36-27b-p67-bench:
     image: vllm/vllm-openai:nightly
-    container_name: vllm-qwen36-27b-dual-turbo
+    container_name: vllm-qwen36-27b-p67-bench
     restart: "no"
     ports:
-      - "8011:8000"
+      - "8013:8000"
     volumes:
       - ${MODEL_DIR:-/mnt/models/huggingface}:/root/.cache/huggingface
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:ro
       - /opt/ai/vllm-src/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:ro
-      # Genesis v7.14 modular package (includes P4 hybrid TQ + P65 #40880 fix)
+      # Genesis v7.48+ (must have P67 + P78)
       - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
-      # Standalone .tolist() during capture fix (separate bug from P65)
-      - ../patches/genesis/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -42,12 +41,17 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
-      # Genesis v7.14 opt-in patches for #40880 fix:
-      - GENESIS_ENABLE_P65_TURBOQUANT_SPEC_CG_DOWNGRADE=1
-      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      # P64/P66/P68/P69 stay ON (orthogonal to P65/P67 trade-off)
       - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
       - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+      # Bench knobs:
+      # - P65 OFF (so we get FULL cudagraph on spec-decode batches)
+      # - P67 ON (multi-query kernel handles K+1 path properly)
+      # - P78 ON (capture-guard .tolist() safety-net)
+      - GENESIS_ENABLE_P67_TQ_MULTI_QUERY_KERNEL=1
+      - GENESIS_ENABLE_P78_TOLIST_CAPTURE_GUARD=1
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -57,7 +61,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    entrypoint: ["/bin/bash", "-c", "pip install xxhash pandas scipy -q && python3 -m vllm._genesis.patches.apply_all && python3 /patches/patch_tolist_cudagraph.py && exec vllm serve \"$@\"", "--"]
+    entrypoint: ["/bin/bash", "-c", "pip install xxhash pandas scipy -q && python3 -m vllm._genesis.patches.apply_all && exec vllm serve \"$@\"", "--"]
     command:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
@@ -71,11 +75,11 @@ services:
       - "2"
       - --disable-custom-all-reduce
       - --max-model-len
-      - "262144"
+      - "32768"
       - --gpu-memory-utilization
-      - "0.85"
+      - "0.90"
       - --max-num-seqs
-      - "4"
+      - "1"
       - --max-num-batched-tokens
       - "4128"
       - --kv-cache-dtype
