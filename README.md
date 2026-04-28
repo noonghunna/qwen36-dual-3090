@@ -1,5 +1,17 @@
 # Qwen3.6-27B on dual RTX 3090
 
+> ## 🚚 Active development moved to **[noonghunna/club-3090](https://github.com/noonghunna/club-3090)**
+>
+> The single-card and dual-card recipes have been consolidated into a single model-agnostic repo organized by inference engine (vLLM / llama.cpp / SGLang) rather than by card count.
+>
+> - **For new setups:** use [club-3090](https://github.com/noonghunna/club-3090) — the dual-card configs live at `models/qwen3.6-27b/vllm/compose/docker-compose.dual*.yml`.
+> - **Existing setups keep working:** this repo isn't deleted; its files are unchanged. But future bug fixes, improvements, and new model support land in club-3090.
+> - **New issues:** please file at [club-3090/issues](https://github.com/noonghunna/club-3090/issues). This repo's issue tracker remains open for ongoing conversations.
+>
+> The original README content is preserved below for users following external links.
+
+---
+
 **Run Qwen3.6-27B at full 262K context with 4-stream concurrency on 2× consumer 24 GB RTX 3090.** Drop-in OpenAI-compatible API, full multimodal feature set, no cloud bills.
 
 ---
