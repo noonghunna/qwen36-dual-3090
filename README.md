@@ -1,13 +1,53 @@
 # Qwen3.6-27B on dual RTX 3090
 
-**A validated recipe for serving Qwen3.6-27B on 2× consumer 24 GB RTX 3090** at TP=2 — full OpenAI API, vision, tool calling, streaming, MTP speculative decoding, real concurrent serving, all verified end-to-end via `scripts/verify-full.sh`.
+**Run Qwen3.6-27B at full 262K context with 4-stream concurrency on 2× consumer 24 GB RTX 3090.** Drop-in OpenAI-compatible API, full multimodal feature set, no cloud bills.
 
-Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via **vLLM nightly** (latest dev branch) with MTP n=3 + fp8_e5m2 KV cache. Currently depends on one patch — **vLLM PR #40361** (Marlin pad-sub-tile-n) — volume-mounted from a local fork until it lands upstream.
+---
 
-**Philosophy:** this stack tracks `vllm:nightly` rather than pinning to a tested digest. Because we use fp8 KV (not TurboQuant), we sidestep most of the anchor-drift surface the single-card project has to manage. We add patches only when nightly actively breaks something for our config.
+## TL;DR — what you'll get
+
+- A 27-billion-parameter model running on **2× RTX 3090** (48 GB combined VRAM) at **TP=2**
+- **OpenAI-compatible API** on `http://localhost:8010` — point any OpenAI SDK at it
+- **All the features** working: chat, vision, tool calling, streaming, reasoning mode
+- **Full 262K context** (Qwen3.6's natural max) with vision enabled
+- **Real concurrent serving** — 2-4 streams at full ctx (turbo variant supports 4)
+- **~71-89 TPS single-stream** (narr / code), **~257 TPS aggregate at 4 streams**
+- **DFlash spec-decode option**: 78 / 128 TPS single-stream (fastest path for code)
+
+**First time here?** → [**Quick start**](#quick-start).
+**Coming from the single-card repo and want to know what changes?** → [What this gives you](#what-this-gives-you-over-the-single-card-project).
+**Hit an error?** → [Troubleshooting](#troubleshooting).
+**Don't know what TP / NVLink / DFlash mean?** → [Glossary](#glossary).
+
+---
+
+## Will this work for you?
+
+| You'll need | Notes |
+|---|---|
+| 2× NVIDIA RTX 3090 (24 GB each) | Other Ampere/Ada cards work too (4090, A6000, A5000) at SM 8.0+. Mixed-card setups are untested by us. |
+| ~30 GB free disk | Model 18 GB + patched vLLM source clone + Docker layers. |
+| Linux (Ubuntu 22.04+ tested) | Same caveats as single-card: vLLM is Linux + CUDA only. WSL2 untested. |
+| Docker + NVIDIA Container Toolkit | If `docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi` shows both GPUs, you're good. |
+| NVIDIA driver 580.x+ | For CUDA 13 runtime in vLLM nightly. `nvidia-smi`. |
+| ATX power supply with capacity for ~460W combined | At 230W per card cap. Most modern ATX PSUs handle this comfortably. |
+| **NVLink bridge NOT required** | The stack disables NVLink-specific NCCL features. PCIe-only is the tested path. If you have NVLink it'll be unused (and that's fine). |
+| Patched vLLM source clone | `vllm#40361` (Marlin pad-sub-tile-n) hasn't landed upstream yet — we volume-mount a local fork. One-time `git clone` during setup. |
+
+**You're probably fine if:** you've successfully run a single-card stack before, you have two slots that fit 3090s with airflow, and you have ~30 minutes for setup.
+
+**Try the [single-card repo](https://github.com/noonghunna/qwen36-27b-single-3090) first if:** you've never run a local LLM, you only have one 3090, or you're not sure dual-card concurrent serving is what you actually need (per-stream TPS isn't much faster than single-card; the win is multi-tenant aggregate throughput).
+
+---
+
+## How this is built (one-paragraph version)
+
+We use [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (the same INT4 quant as the single-card repo) on **vLLM nightly** with **TP=2** (tensor parallelism splits the model across both cards). The default ships with **fp8 KV cache + MTP n=3 spec-decode**, which gets you full 262K context with 2× concurrency. A **turbo variant** swaps fp8 KV for TurboQuant 3-bit + Genesis v7.14 patches to unlock 4× concurrency at the same ctx. A **DFlash variant** uses [Luce DFlash N=5 spec-decode](https://github.com/luce-spec/dflash-vllm) for the fastest per-stream code TPS (128 vs 89 default). All variants currently need [`vllm#40361`](https://github.com/vllm-project/vllm/pull/40361) (Marlin pad-sub-tile-n) volume-mounted as a fork until it lands upstream.
 
 > 📖 **Companion repo:** [qwen36-27b-single-3090](https://github.com/noonghunna/qwen36-27b-single-3090) — same model on a single 3090.
-> 🐛 **Open upstream PR (dependency):** [vllm-project/vllm#40361](https://github.com/vllm-project/vllm/pull/40361) — drops out as a dependency when this lands.
+> 🐛 **Upstream PR (dependency):** [vllm-project/vllm#40361](https://github.com/vllm-project/vllm/pull/40361) — drops out when this lands.
+
+**Philosophy:** this stack tracks `vllm:nightly` rather than pinning to a tested digest. Because we use fp8 KV (not TurboQuant) by default, we sidestep most of the anchor-drift surface the single-card project has to manage. We add patches only when nightly actively breaks something for our config.
 
 ---
 
@@ -100,6 +140,26 @@ cd .. && bash scripts/bench.sh
 ```
 
 The stack serves on `http://localhost:8010/v1/*` as a drop-in OpenAI-compatible endpoint.
+
+### What success looks like
+
+If everything booted correctly, `docker logs vllm-qwen36-27b-dual` should show:
+
+```
+INFO ...  [marlin-patch] applying pad-sub-tile-n diff to /usr/local/lib/python3.12/dist-packages/vllm/...
+INFO ...  Tensor parallelism initialized across 2 GPUs (TP=2)
+INFO ...  Available KV cache memory: 5.x GiB per GPU (262K-token pool)
+INFO ...  Application startup complete.
+```
+
+`nvidia-smi` should show two processes, one on each GPU, each using ~22-23 GB VRAM (mirror copy of TP-split layers + KV pool half).
+
+A successful curl returns the standard OpenAI completion shape (Paris answer for the sanity test).
+
+For thorough verification (all 10 functional checks — server, Genesis patches if turbo, tool calling, streaming, thinking, long-context recall, tool-prefill safety, output quality, MTP acceptance):
+```bash
+bash scripts/verify-full.sh
+```
 
 ---
 
@@ -266,9 +326,12 @@ Cold prefill is the dominant cost at long context — vLLM chunked-prefills at 8
 
 ```
 qwen36-dual-3090/
-├── README.md                              (this file)
+├── README.md                              (this file — start here)
+├── CHANGELOG.md                           dated history
 ├── LICENSE                                Apache-2.0
-├── .gitignore
+├── docs/
+│   ├── INTERNALS.md                       deep technical: Marlin patch mechanics, TP=2 allreduce, DFlash N=5
+│   └── USE_CASES.md                       per-workload guides: multi-tenant, frontier ctx, RAG, code, vision
 ├── patches/
 │   ├── README.md                          Marlin pad PR #40361 dependency notes
 │   └── genesis/                           cloned by setup.sh → Sandermage/genesis-vllm-patches
@@ -277,15 +340,37 @@ qwen36-dual-3090/
 │   ├── docker-compose.turbo.yml           Turbo — TurboQuant_3bit_nc + Genesis v7.14 + 4-stream (port 8011)
 │   ├── docker-compose.dflash.yml          DFlash — N=5 + 185K + vision (port 8012)
 │   ├── docker-compose.dflash-noviz.yml    DFlash text-only — N=5 + 200K (port 8013)
-│   ├── docker-compose.p67-bench.yml       BENCH — 27B + MTP + Genesis v7.48 P67/P78 (port 8013)
-│   ├── docker-compose.p67-bench-dflash.yml      BENCH — 27B + DFlash N=5 + Genesis v7.48 (port 8014)
-│   └── docker-compose.p67-bench-35b-dflash.yml  BENCH — 35B-A3B + DFlash + Genesis v7.48 (port 8015)
+│   ├── docker-compose.p67-bench.yml       BENCH — 27B + MTP + Genesis v7.48 P67/P78
+│   ├── docker-compose.p67-bench-dflash.yml      BENCH — 27B + DFlash N=5 + Genesis v7.48
+│   └── docker-compose.p67-bench-35b-dflash.yml  BENCH — 35B-A3B + DFlash + Genesis v7.48
 └── scripts/
     ├── setup.sh                           model SHA-verify + clones genesis-vllm-patches
     ├── verify.sh                          quick smoke test (~10 sec)
-    ├── verify-full.sh                     full functional test (~3 min); --bench flag chains bench.sh
+    ├── verify-full.sh                     full functional test — 10 checks (~3 min)
     └── bench.sh                           canonical TPS bench (wall_TPS / decode_TPS / TTFT / CV)
 ```
+
+> 📜 **Want the engineering depth?** [docs/INTERNALS.md](docs/INTERNALS.md) covers Marlin pad mechanics, TP=2 allreduce, DFlash, P67.
+> 📚 **Specific workload?** [docs/USE_CASES.md](docs/USE_CASES.md) has per-use-case configs and gotchas.
+> 📅 **What changed when?** [CHANGELOG.md](CHANGELOG.md) is the dated log.
+> 🔬 **Trying llama.cpp / SGLang instead of vLLM?** Engine comparison and quick recipes lives in the [single-card repo's docs/engines/](https://github.com/noonghunna/qwen36-27b-single-3090/tree/master/docs/engines).
+
+---
+
+## Glossary
+
+| Term | What it means |
+|---|---|
+| **TP=2 / tensor parallelism** | Splits each model layer's weights across both GPUs; layers compute together, results combined via NCCL all-reduce. Doubles effective VRAM (48 GB total) but adds inter-GPU communication cost per forward step. |
+| **NVLink** | NVIDIA's high-bandwidth GPU-to-GPU interconnect (~600 GB/s on 3090). 3090s have a connector but it's unused if no bridge is installed. We disable NVLink-dependent NCCL features and run PCIe-only. |
+| **Allreduce** | The collective op TP uses to combine partial results from each GPU. On PCIe-only consumer Ampere this is ~3-5× slower than NVLink, so single-stream TPS gain from TP=2 is modest (~5%). |
+| **Concurrent streams** | Multiple users/agents serving simultaneously. KV pool is shared; each stream gets a slice. The dual stack supports 2-4 concurrent at full 262K (depending on variant). Aggregate throughput scales near-linearly to ~4 streams. |
+| **DFlash / DFlash N=5** | A custom 5-token draft model from z-lab specialized for Qwen3.6, optimized for code workloads. Replaces MTP n=3 with an external small model that runs in parallel; nets 78/128 vs 71/89 TPS narr/code. |
+| **MTP** | Multi-Token Prediction — built-in spec-decode head that ships with Qwen3.6. Default for the fp8 + Turbo variants. |
+| **Marlin pad-sub-tile-n** | A specific bug in vLLM's Marlin INT4 kernel where output features < 64 cause a crash on TP=2 (the TP-split makes some Lorbus tensors thinner than the kernel's minimum). Our [PR #40361](https://github.com/vllm-project/vllm/pull/40361) pads them to the kernel-min before dispatch. |
+| **TurboQuant** | A 3-bit KV cache compression scheme. Smaller per-token KV → can fit more tokens at the same mem-util → more concurrent streams in the KV pool. We use it in the Turbo variant. |
+| **fp8 / fp8_e5m2** | An 8-bit float KV cache format. Larger per-token bytes than TurboQuant but dodges several upstream bugs that affect TQ. The default variant uses fp8 — simpler, fewer patches, full feature support. |
+| **Prefix cache** | When two requests share a leading prompt, vLLM serves the second from cache (skips re-prefill). Especially useful for long-document workflows where users iterate against the same loaded doc. |
 
 ---
 
