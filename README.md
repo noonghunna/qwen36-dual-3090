@@ -225,6 +225,8 @@ CV (coefficient of variation) is the headline stability metric — Sandermage's 
 
 You can also run `bash scripts/verify-full.sh --bench` to do "verify + measure" in one command — runs all correctness checks first (server up, tool calls, recall ladder, etc.) and then the bench if everything passes.
 
+The script now has **10 functional checks** (was 7): server, Genesis patches applied, basic completion, tool calling, streaming, thinking, long-context needle, **(8) tool-response prefill OOM** (multi-turn payload with a ~25K-token mock tool message — catches activation-memory peak crashes), **(9) output quality / cascade detection** (2K-token essay scanned for `<tool_call>` inline cascade and repetitive degeneracy), **(10) MTP acceptance length threshold** (parses SpecDecoding metrics from logs, asserts mean AL ≥ 2.0). The new tests inherit from the single-3090 [#1 prefill-OOM investigation](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) — TP=2 with fp8 KV (the default here) gives much wider safety margins than single-card TQ3 KV does, but the same bug classes can theoretically fire under extreme workloads, and the tests are cheap insurance.
+
 Same canonical prompts as the single-card project (800-word essay, quicksort code), so numbers are directly comparable.
 
 ### Measured numbers (1× RTX 3090 each at 230W cap, vLLM nightly digest 9bba4628)

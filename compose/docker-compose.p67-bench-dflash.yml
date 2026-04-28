@@ -11,7 +11,7 @@
 # ===========================================================================
 services:
   vllm-qwen36-27b-p67-bench-dflash:
-    image: vllm/vllm-openai:nightly
+    image: vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08
     container_name: vllm-qwen36-27b-p67-bench-dflash
     restart: "no"
     ports:
